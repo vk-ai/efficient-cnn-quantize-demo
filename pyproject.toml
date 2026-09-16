@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "efficient-cnn-quantize-demo"
+version = "0.1.0"
+description = "OSS learning: CPU-friendly tiny efficient CNN + int8 fake-quant and magnitude pruning with before/after eval."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "vk-ai" }]
+keywords = ["cnn", "quantization", "pruning", "edge", "numpy", "efficient", "learning"]
+dependencies = [
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+efficient-cnn = "efficient_cnn.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/vk-ai/efficient-cnn-quantize-demo"
+Issues = "https://github.com/vk-ai/efficient-cnn-quantize-demo/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/efficient_cnn"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/efficient_cnn" = "efficient_cnn"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

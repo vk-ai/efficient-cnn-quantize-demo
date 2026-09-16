@@ -1,0 +1,19 @@
+seed: 42
+data:
+  n_train: 256
+  n_test: 128
+  height: 8
+  width: 8
+  channels: 1
+  n_classes: 4
+  noise: 0.05
+model:
+  width: 8
+train:
+  epochs: 25
+  lr: 0.15
+  batch_size: 32
+quantize:
+  bits: 8
+prune:
+  sparsity: 0.5
