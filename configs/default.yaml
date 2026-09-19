@@ -17,3 +17,7 @@ quantize:
   bits: 8
 prune:
   sparsity: 0.5
+# Ordered compression pipeline for the compose eval row (prune → int8 fake-quant).
+# Community recipes often prefer prune-then-quantize; order matters for sparsity + size.
+compose:
+  order: [prune, quantize]

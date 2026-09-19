@@ -12,3 +12,5 @@ def test_eval_harness_keys_and_bounds():
     assert report["quantized"]["acc"] >= report["baseline"]["acc"] - 0.10
     assert report["pruned"]["acc"] >= report["baseline"]["acc"] - 0.40
     assert "flops" in report["baseline"]
+    assert "prune_then_int8" in report
+    assert report["prune_then_int8"]["order"] == ["prune", "quantize"]
