@@ -26,7 +26,7 @@ This repo is that slice.
 | `src/efficient_cnn/train.py` | Minibatch SGD with analytical backprop |
 | `src/efficient_cnn/quantize.py` | Post-training int8 fake-quant (scale + ZP) |
 | `src/efficient_cnn/prune.py` | Global-per-tensor magnitude pruning |
-| `src/efficient_cnn/eval.py` | Float vs quant vs prune harness |
+| `src/efficient_cnn/eval.py` | Float vs quant vs prune vs **prune→int8 compose** harness |
 | `configs/default.yaml` | Width, bits, sparsity, train knobs |
 | `evals/runner.py` | CI-friendly eval CLI + JSON report |
 | `tests/` | Unit + train + harness (pytest, seconds on CPU) |
@@ -52,6 +52,7 @@ Efficient CNN quantize/prune eval
   baseline  loss=0.xx  acc=0.xx  params=…  flops≈…  nbytes_fp64=…
   int8 fq   loss=0.xx  acc=0.xx  nbytes≈…  size_ratio=0.xx  acc_drop=±0.xx
   prune     loss=0.xx  acc=0.xx  nonzero=…  pruned=…  acc_drop=±0.xx
+  compose   order=prune→quantize  loss=0.xx  acc=0.xx  nonzero=…  nbytes≈…  size_ratio=0.xx
 ```
 
 ## Efficient block (toy)
@@ -71,6 +72,8 @@ Weights are fake-quantized in float for the forward pass; size stats compare fp6
 
 **Magnitude prune:** zero the lowest-|w| fraction per weight tensor (`configs/default.yaml` → `prune.sparsity`).
 
+**Compose (prune → int8):** set `compose.order: [prune, quantize]` to run the fourth eval row. Order is configurable for teaching; default matches the common prune-then-quantize recipe.
+
 ## Eval harness
 
 `run_before_after(cfg)` trains the float model, then scores:
@@ -78,6 +81,9 @@ Weights are fake-quantized in float for the forward pass; size stats compare fp6
 1. **baseline** — loss, accuracy, params, rough FLOPs, fp64 nbytes  
 2. **int8 fake-quant** — loss/acc + packed size ratio  
 3. **magnitude prune** — loss/acc + nonzero count  
+4. **compose (`prune_then_int8`)** — magnitude prune → fake-quant on remaining weights (`compose.order` in YAML)
+
+**Why order matters:** community recipes often prefer prune→INT8 (then optionally distill) over isolated ops; sparsity changes the weight distribution that PTQ sees. This demo only shows the toy compose path — still **fake-quant**, not TensorRT/ONNX Runtime kernels or QAT. See e.g. [r/computervision on prune/distill/quantize order](https://www.reddit.com/r/computervision/comments/1i84qw7/prune_distill_quantize_whats_the_best_order/).
 
 ```bash
 pytest tests/ -q
