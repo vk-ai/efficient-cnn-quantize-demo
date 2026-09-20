@@ -15,6 +15,13 @@ train:
   batch_size: 32
 quantize:
   bits: 8
+  # Weight-range PTQ observers (teaching stub — fake-quant, not TensorRT calibrators).
+  # minmax | percentile
+  observer: minmax
+  percentile: 99.0
+  # Leave matching weight tensors in float (substring match on names: stem_w, dw_w, pw_w, fc_w).
+  # Example: [fc] keeps the classifier head float (selective / skip-sensitive-layers pattern).
+  skip: []
 prune:
   sparsity: 0.5
 # Ordered compression pipeline for the compose eval row (prune → int8 fake-quant).

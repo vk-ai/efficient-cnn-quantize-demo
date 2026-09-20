@@ -24,7 +24,7 @@ This repo is that slice.
 | `src/efficient_cnn/model.py` | Tiny stem → DW+PW → GAP → linear CNN |
 | `src/efficient_cnn/data.py` | Synthetic quadrant-blob images (no network) |
 | `src/efficient_cnn/train.py` | Minibatch SGD with analytical backprop |
-| `src/efficient_cnn/quantize.py` | Post-training int8 fake-quant (scale + ZP) |
+| `src/efficient_cnn/quantize.py` | PTQ int8 fake-quant + minmax/percentile observers + skip-list |
 | `src/efficient_cnn/prune.py` | Global-per-tensor magnitude pruning |
 | `src/efficient_cnn/eval.py` | Float vs quant vs prune vs **prune→int8 compose** harness |
 | `configs/default.yaml` | Width, bits, sparsity, train knobs |
@@ -73,6 +73,11 @@ Weights are fake-quantized in float for the forward pass; size stats compare fp6
 **Magnitude prune:** zero the lowest-|w| fraction per weight tensor (`configs/default.yaml` → `prune.sparsity`).
 
 **Compose (prune → int8):** set `compose.order: [prune, quantize]` to run the fourth eval row. Order is configurable for teaching; default matches the common prune-then-quantize recipe.
+
+
+**Calibration observers (teaching stub):** `quantize.observer: minmax | percentile` chooses how weight ranges are measured before affine fake-quant. `percentile` clips to the p-th abs quantile (`quantize.percentile`, default 99) — a tiny stand-in for histogram/percentile calibrators in TensorRT/ModelOpt, **not** those products.
+
+**Selective quant / skip list:** `quantize.skip: [fc]` (substring match on weight names) leaves sensitive layers in float — the usual “skip the head” pattern. Eval adds rows `int8_minmax`, `int8_percentile`, `int8_skip_head` alongside the existing `prune_then_int8` compose row.
 
 ## Eval harness
 
