@@ -60,6 +60,8 @@ def apply_compose(
                 "bits": q_stats.bits,
                 "nbytes_fp64": q_stats.nbytes_fp64,
                 "nbytes_int8": q_stats.nbytes_int8,
+                "observer": q_stats.observer,
+                "skipped": list(q_stats.skipped),
             }
         else:  # pragma: no cover - validated in _compose_order
             raise ValueError(f"unknown compose step: {step}")
@@ -109,8 +111,42 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     base_nnz = param_count(model, nonzero_only=True)
     flops = estimate_flops(model, int(d["height"]), int(d["width"]))
 
-    q_model, q_stats = quantize_model(model, bits=int(q["bits"]))
-    q_loss, q_acc = q_model.loss_acc(test_ds.X, test_ds.y)
+    bits = int(q["bits"])
+    observer = str(q.get("observer", "minmax"))
+    percentile = float(q.get("percentile", 99.0))
+    skip = list(q.get("skip") or [])
+
+    def _quant_row(obs: str, skip_list: list[str], *, label_bits: bool = True) -> tuple:
+        qm, qs = quantize_model(
+            model,
+            bits=bits,
+            observer=obs,
+            percentile=percentile,
+            skip=skip_list,
+        )
+        loss, acc = qm.loss_acc(test_ds.X, test_ds.y)
+        row = {
+            "bits": qs.bits if label_bits else bits,
+            "observer": qs.observer,
+            "percentile": qs.percentile,
+            "skip": list(skip_list),
+            "skipped": list(qs.skipped),
+            "quantized": list(qs.quantized),
+            "loss": loss,
+            "acc": acc,
+            "nbytes_int8_pack": qs.nbytes_int8,
+            "size_ratio": qs.nbytes_int8 / max(qs.nbytes_fp64, 1),
+            "acc_drop": base_acc - acc,
+        }
+        return qm, qs, row
+
+    # Default quantized row = configured observer + skip (backward-compatible key)
+    _, q_stats, quantized_row = _quant_row(observer, skip)
+    _, _, int8_minmax_row = _quant_row("minmax", [])
+    _, _, int8_percentile_row = _quant_row("percentile", [])
+    # Skip-head teaching row: leave classifier (fc*) in float
+    skip_head = skip if skip else ["fc"]
+    _, _, int8_skip_head_row = _quant_row("minmax", skip_head)
 
     p_model, p_stats = prune_model(model, sparsity=float(p["sparsity"]))
     p_loss, p_acc = p_model.loss_acc(test_ds.X, test_ds.y)
@@ -119,7 +155,7 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     c_model, c_meta = apply_compose(
         model,
         order,
-        bits=int(q["bits"]),
+        bits=bits,
         sparsity=float(p["sparsity"]),
     )
     c_loss, c_acc = c_model.loss_acc(test_ds.X, test_ds.y)
@@ -137,14 +173,10 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
             "flops": flops,
             "nbytes_fp64": q_stats.nbytes_fp64,
         },
-        "quantized": {
-            "bits": q_stats.bits,
-            "loss": q_loss,
-            "acc": q_acc,
-            "nbytes_int8_pack": q_stats.nbytes_int8,
-            "size_ratio": q_stats.nbytes_int8 / max(q_stats.nbytes_fp64, 1),
-            "acc_drop": base_acc - q_acc,
-        },
+        "quantized": quantized_row,
+        "int8_minmax": int8_minmax_row,
+        "int8_percentile": int8_percentile_row,
+        "int8_skip_head": int8_skip_head_row,
         "pruned": {
             "sparsity": p_stats.sparsity,
             "loss": p_loss,
@@ -164,28 +196,44 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
             "steps": c_meta["steps"],
         },
         "compose": {"order": c_meta["order"]},
+        "quantize_config": {
+            "bits": bits,
+            "observer": observer,
+            "percentile": percentile,
+            "skip": skip,
+        },
     }
     return report
 
 
 def format_report(report: dict[str, Any]) -> str:
-    b, q, p, c = (
-        report["baseline"],
-        report["quantized"],
-        report["pruned"],
-        report["prune_then_int8"],
-    )
+    b = report["baseline"]
+    q = report["quantized"]
+    p = report["pruned"]
+    c = report["prune_then_int8"]
+    mm = report["int8_minmax"]
+    pc = report["int8_percentile"]
+    sk = report["int8_skip_head"]
     lines = [
         "Efficient CNN quantize/prune eval",
-        f"  baseline  loss={b['loss']:.4f}  acc={b['acc']:.3f}  "
+        f"  baseline        loss={b['loss']:.4f}  acc={b['acc']:.3f}  "
         f"params={b['params']}  flops≈{b['flops']}  nbytes_fp64={b['nbytes_fp64']}",
-        f"  int8 fq   loss={q['loss']:.4f}  acc={q['acc']:.3f}  "
-        f"nbytes≈{q['nbytes_int8_pack']}  size_ratio={q['size_ratio']:.3f}  "
-        f"acc_drop={q['acc_drop']:+.3f}",
-        f"  prune     loss={p['loss']:.4f}  acc={p['acc']:.3f}  "
+        f"  int8_minmax     loss={mm['loss']:.4f}  acc={mm['acc']:.3f}  "
+        f"nbytes≈{mm['nbytes_int8_pack']}  size_ratio={mm['size_ratio']:.3f}  "
+        f"acc_drop={mm['acc_drop']:+.3f}",
+        f"  int8_percentile loss={pc['loss']:.4f}  acc={pc['acc']:.3f}  "
+        f"nbytes≈{pc['nbytes_int8_pack']}  size_ratio={pc['size_ratio']:.3f}  "
+        f"acc_drop={pc['acc_drop']:+.3f}  p={pc['percentile']}",
+        f"  int8_skip_head  loss={sk['loss']:.4f}  acc={sk['acc']:.3f}  "
+        f"nbytes≈{sk['nbytes_int8_pack']}  skip={sk['skip']}  skipped={sk['skipped']}  "
+        f"acc_drop={sk['acc_drop']:+.3f}",
+        f"  int8 fq (cfg)   loss={q['loss']:.4f}  acc={q['acc']:.3f}  "
+        f"observer={q['observer']}  nbytes≈{q['nbytes_int8_pack']}  "
+        f"size_ratio={q['size_ratio']:.3f}  acc_drop={q['acc_drop']:+.3f}",
+        f"  prune           loss={p['loss']:.4f}  acc={p['acc']:.3f}  "
         f"nonzero={p['nonzero']}  pruned={p['pruned_weights']}  "
         f"acc_drop={p['acc_drop']:+.3f}",
-        f"  compose   order={'→'.join(c['order'])}  loss={c['loss']:.4f}  "
+        f"  compose         order={'→'.join(c['order'])}  loss={c['loss']:.4f}  "
         f"acc={c['acc']:.3f}  nonzero={c['nonzero']}  "
         f"nbytes≈{c['nbytes_int8_pack']}  size_ratio={c['size_ratio']:.3f}  "
         f"acc_drop={c['acc_drop']:+.3f}",
