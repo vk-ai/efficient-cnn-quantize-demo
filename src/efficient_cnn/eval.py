@@ -13,6 +13,8 @@ from efficient_cnn.model import TinyEfficientCNN
 from efficient_cnn.prune import prune_model
 from efficient_cnn.quantize import quantize_model
 from efficient_cnn.train import train
+from efficient_cnn.distill import run_kd_demo
+from efficient_cnn.qat import run_qat_demo
 
 DEFAULT_COMPOSE_ORDER = ("prune", "quantize")
 
@@ -203,6 +205,12 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
             "skip": skip,
         },
     }
+    distill_cfg = cfg.get("distill") or {}
+    if distill_cfg.get("enabled", False):
+        report["distill"] = run_kd_demo(cfg, train_ds, test_ds)
+    qat_cfg = cfg.get("qat") or {}
+    if qat_cfg.get("enabled", False):
+        report["qat_vs_ptq"] = run_qat_demo(model, train_ds, test_ds, cfg)
     return report
 
 
@@ -238,4 +246,20 @@ def format_report(report: dict[str, Any]) -> str:
         f"nbytes≈{c['nbytes_int8_pack']}  size_ratio={c['size_ratio']:.3f}  "
         f"acc_drop={c['acc_drop']:+.3f}",
     ]
+    if "distill" in report:
+        d = report["distill"]
+        lines.append(
+            f"  distill        teacher_acc={d['teacher']['acc']:.3f}  "
+            f"student_solo={d['student_solo']['acc']:.3f}  "
+            f"student_kd={d['student_kd']['acc']:.3f}  "
+            f"T={d['temperature']}  alpha={d['alpha']}"
+        )
+    if "qat_vs_ptq" in report:
+        qv = report["qat_vs_ptq"]
+        lines.append(
+            f"  qat_vs_ptq     float_acc={qv['float']['acc']:.3f}  "
+            f"ptq_acc={qv['ptq']['acc']:.3f}  "
+            f"qat_acc={qv['qat']['acc']:.3f}  "
+            f"qat_steps={qv['qat']['steps']}"
+        )
     return "\n".join(lines)
