@@ -28,3 +28,16 @@ prune:
 # Community recipes often prefer prune-then-quantize; order matters for sparsity + size.
 compose:
   order: [prune, quantize]
+# Knowledge distillation (teacher → thinner student). Teaching stub — not production KD.
+distill:
+  enabled: true
+  temperature: 2.0
+  alpha: 0.7
+  student_width: 4
+  teacher_epochs: 12
+  epochs: 8
+# Fake-quant QAT (prepare → few steps → convert). Compare against PTQ in the report.
+qat:
+  enabled: true
+  steps: 12
+  lr: 0.05
