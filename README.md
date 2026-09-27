@@ -25,6 +25,8 @@ This repo is that slice.
 | `src/efficient_cnn/data.py` | Synthetic quadrant-blob images (no network) |
 | `src/efficient_cnn/train.py` | Minibatch SGD with analytical backprop |
 | `src/efficient_cnn/quantize.py` | PTQ int8 fake-quant + minmax/percentile observers + skip-list |
+| `src/efficient_cnn/distill.py` | Teacher→student KD (temperature softmax + CE mix) |
+| `src/efficient_cnn/qat.py` | Fake-quant QAT: prepare → few steps → convert (vs PTQ) |
 | `src/efficient_cnn/prune.py` | Global-per-tensor magnitude pruning |
 | `src/efficient_cnn/eval.py` | Float vs quant vs prune vs **prune→int8 compose** harness |
 | `configs/default.yaml` | Width, bits, sparsity, train knobs |
@@ -78,6 +80,23 @@ Weights are fake-quantized in float for the forward pass; size stats compare fp6
 **Calibration observers (teaching stub):** `quantize.observer: minmax | percentile` chooses how weight ranges are measured before affine fake-quant. `percentile` clips to the p-th abs quantile (`quantize.percentile`, default 99) — a tiny stand-in for histogram/percentile calibrators in TensorRT/ModelOpt, **not** those products.
 
 **Selective quant / skip list:** `quantize.skip: [fc]` (substring match on weight names) leaves sensitive layers in float — the usual “skip the head” pattern. Eval adds rows `int8_minmax`, `int8_percentile`, `int8_skip_head` alongside the existing `prune_then_int8` compose row.
+
+
+## Knowledge distillation + QAT (round 3)
+
+**KD:** train a wider teacher, distill into a thinner student with
+
+```text
+L = α · T² · KL(softmax(z_t/T) ∥ softmax(z_s/T)) + (1−α) · CE(z_s, y)
+```
+
+Config: `distill.enabled`, `temperature`, `alpha`, `student_width`  
+([PyTorch KD tutorial](https://docs.pytorch.org/tutorials/beginner/knowledge_distillation_tutorial.html)).
+
+**QAT:** fake-quant weights during a few SGD steps, then convert to the same int8 path as PTQ. Report row `qat_vs_ptq` contrasts float / PTQ / QAT  
+([torchao QAT](https://docs.pytorch.org/ao/stable/workflows/qat.html)).
+
+Recommended ladder (document only): train → (optional KD) → prune → (optional QAT) → PTQ/int8. Still **fake-quant**, not TensorRT.
 
 ## Eval harness
 
