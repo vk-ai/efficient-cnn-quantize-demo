@@ -18,9 +18,8 @@ from efficient_cnn.data import ImageDataset
 from efficient_cnn.quantize import (
     WEIGHT_KEYS,
     QuantStats,
-    _affine_params,
-    fake_quantize_tensor,
     quantize_model,
+    quantize_weight,
 )
 from efficient_cnn.model import TinyEfficientCNN
 from efficient_cnn.train import _train_step
@@ -33,11 +32,14 @@ def prepare_qat(
     observer: str = "minmax",
     percentile: float = 99.0,
     skip: Sequence[str] | None = None,
+    granularity: str = "per_tensor",
 ) -> tuple[TinyEfficientCNN, dict[str, tuple[float, int]]]:
     """
     Fake-quant weights in-place copy (prepare). Returns model + scale/zp map.
 
-    Biases stay float. Skip list matches PTQ ``quantize.skip``.
+    Biases stay float. Skip list matches PTQ ``quantize.skip``. ``granularity``
+    matches PTQ ``quantize.granularity`` (per_channel → scale/zp map holds the
+    largest channel scale as a summary).
     """
     out = model.copy()
     qparams: dict[str, tuple[float, int]] = {}
@@ -48,9 +50,12 @@ def prepare_qat(
             continue
         if any(s in name for s in skip_list):
             continue
-        scale, zp = _affine_params(arr, bits=bits, observer=observer, percentile=percentile)
-        qparams[name] = (scale, zp)
-        params[name] = fake_quantize_tensor(arr, scale, zp, bits=bits)
+        wq, scales, zps = quantize_weight(
+            arr, bits, granularity=granularity, observer=observer, percentile=percentile
+        )
+        i = int(np.argmax(scales))
+        qparams[name] = (float(scales[i]), int(zps[i]))
+        params[name] = wq
     out.set_params(params)
     return out, qparams
 
@@ -67,6 +72,7 @@ def qat_train(
     percentile: float = 99.0,
     skip: Sequence[str] | None = None,
     seed: int = 0,
+    granularity: str = "per_tensor",
 ) -> list[float]:
     """
     Few-step QAT: each step SGD then re-fake-quant weights (STE-style teaching).
@@ -86,7 +92,12 @@ def qat_train(
         loss = _train_step(model, xb, yb, lr)
         # Snap weights to fake-quant grid
         snapped, _ = prepare_qat(
-            model, bits=bits, observer=observer, percentile=percentile, skip=skip_list
+            model,
+            bits=bits,
+            observer=observer,
+            percentile=percentile,
+            skip=skip_list,
+            granularity=granularity,
         )
         model.set_params(snapped.named_params())
         losses.append(loss)
@@ -100,10 +111,16 @@ def convert_qat(
     observer: str = "minmax",
     percentile: float = 99.0,
     skip: Sequence[str] | None = None,
+    granularity: str = "per_tensor",
 ) -> tuple[TinyEfficientCNN, QuantStats]:
     """Convert after QAT — same packed int8 stats path as PTQ."""
     return quantize_model(
-        model, bits=bits, observer=observer, percentile=percentile, skip=skip
+        model,
+        bits=bits,
+        observer=observer,
+        percentile=percentile,
+        skip=skip,
+        granularity=granularity,
     )
 
 
@@ -120,6 +137,7 @@ def run_qat_demo(
     observer = str(q.get("observer", "minmax"))
     percentile = float(q.get("percentile", 99.0))
     skip = list(q.get("skip") or [])
+    granularity = str(q.get("granularity", "per_tensor"))
     steps = int(qat_cfg.get("steps", 20))
     lr = float(qat_cfg.get("lr", cfg.get("train", {}).get("lr", 0.05)))
     batch_size = int(cfg.get("train", {}).get("batch_size", 32))
@@ -127,7 +145,12 @@ def run_qat_demo(
 
     # PTQ baseline from float
     ptq_model, ptq_stats = quantize_model(
-        float_model, bits=bits, observer=observer, percentile=percentile, skip=skip
+        float_model,
+        bits=bits,
+        observer=observer,
+        percentile=percentile,
+        skip=skip,
+        granularity=granularity,
     )
     ptq_loss, ptq_acc = ptq_model.loss_acc(test_ds.X, test_ds.y)
 
@@ -144,14 +167,21 @@ def run_qat_demo(
         percentile=percentile,
         skip=skip,
         seed=seed + 9,
+        granularity=granularity,
     )
     qat_converted, qat_stats = convert_qat(
-        qat_model, bits=bits, observer=observer, percentile=percentile, skip=skip
+        qat_model,
+        bits=bits,
+        observer=observer,
+        percentile=percentile,
+        skip=skip,
+        granularity=granularity,
     )
     qat_loss, qat_acc = qat_converted.loss_acc(test_ds.X, test_ds.y)
     float_loss, float_acc = float_model.loss_acc(test_ds.X, test_ds.y)
 
     return {
+        "granularity": granularity,
         "float": {"loss": float_loss, "acc": float_acc},
         "ptq": {
             "loss": ptq_loss,

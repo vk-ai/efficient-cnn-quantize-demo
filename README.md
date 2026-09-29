@@ -24,7 +24,7 @@ This repo is that slice.
 | `src/efficient_cnn/model.py` | Tiny stem → DW+PW → GAP → linear CNN |
 | `src/efficient_cnn/data.py` | Synthetic quadrant-blob images (no network) |
 | `src/efficient_cnn/train.py` | Minibatch SGD with analytical backprop |
-| `src/efficient_cnn/quantize.py` | PTQ int8 fake-quant + minmax/percentile observers + skip-list |
+| `src/efficient_cnn/quantize.py` | PTQ int8 fake-quant + minmax/percentile observers + skip-list + `per_tensor`/`per_channel` granularity + per-layer error table |
 | `src/efficient_cnn/distill.py` | Teacher→student KD (temperature softmax + CE mix) |
 | `src/efficient_cnn/qat.py` | Fake-quant QAT: prepare → few steps → convert (vs PTQ) |
 | `src/efficient_cnn/prune.py` | Global-per-tensor magnitude pruning |
@@ -112,6 +112,35 @@ Recommended ladder (document only): train → (optional KD) → prune → (optio
 ```bash
 pytest tests/ -q
 ```
+
+## Per-channel weight quantization (round 4)
+
+Config switch `quantize.granularity: per_tensor | per_channel` (default `per_tensor`, which is the unchanged behaviour). `per_channel` gives every **output channel** (axis 0) its own affine `(scale, zero_point)`, using the same observer and formula as above. The switch applies to the configured PTQ row, the compose row, and QAT.
+
+```python
+from efficient_cnn.quantize import quantize_model, layer_error_table, format_layer_error_table
+qm, stats = quantize_model(model, bits=8, granularity="per_channel")
+stats.channel_scale["dw_w"]        # 8 scales, one per depthwise filter
+stats.nbytes_qparams               # scale/zp overhead: 5 B per group (fp32 scale + int8 zp)
+print(format_layer_error_table(layer_error_table(model, (8, 4), x=test_X[:64])))
+```
+
+**Why the depthwise layer:** a depthwise filter sees one channel only, so ranges can differ a lot between filters (BN folding makes this worse in real MobileNets). One scale per tensor then spends most of the levels on the widest channel and crushes the rest ([Sheng et al., arXiv 1803.08607](https://ar5iv.labs.arxiv.org/html/1803.08607)). Per-channel weight scales are the standard fix ([Wu et al. / NVIDIA, arXiv 2004.09602](https://arxiv.org/pdf/2004.09602), [NVIDIA blog](https://developer.nvidia.com/blog/model-quantization-concepts-methods-and-why-it-matters/)). It is also the first thing people hit when "quantization killed my accuracy" ([r/learnmachinelearning](https://www.reddit.com/r/learnmachinelearning/comments/1ta3k82/quantization_killed_my_models_accuracy/)).
+
+`python evals/runner.py` now also prints:
+
+- **Granularity ablation**: `int8_per_tensor`, `int8_per_channel`, and optional `int4_*` (`quantize.int4_rows`).
+- **Per-layer error table** (`quantize.error_table`): weight MSE per_tensor vs per_channel, their ratio, the per-channel **range spread** (max/min range), and logit MSE when *only that layer* is quantized. The depthwise row is marked `◀ depthwise`.
+- **Depthwise outlier stress** (`quantize.dw_outlier_factor`, default 64). Depthwise channel 0 is scaled ×k and the matching pointwise input column ÷k. ReLU is positively homogeneous, so the float logits are **identical**, but the depthwise tensor now has one very wide channel.
+
+```text
+layer   bits  ch  spread  mse_tensor mse_channel  ratio logit_mse_t logit_mse_c
+dw_w       8   8    2.95   8.348e-06   3.371e-06    2.5   8.536e-05   6.419e-06  ◀ depthwise
+dw_w       4   8    2.95   2.363e-03   8.227e-04    2.9   6.739e-03   5.522e-03  ◀ depthwise
+  dw_outlier x64 (float_acc=1.000, same logits)  int8_per_tensor=1.000  int8_per_channel=1.000  int4_per_tensor=0.281  int4_per_channel=1.000
+```
+
+**Honest reading:** on the trained 8×8 toy, int8 is already lossless at either granularity. Per-channel roughly halves the weight MSE on every layer, and it is not always lower on each individual tensor (rounding and zero-point effects). The depthwise layer is *not* dramatically worse than the others here, because its channel spread is only about 3×. The gap becomes visible once the ranges diverge: in the outlier stress, per-tensor int4 falls to chance (0.28) while per-channel stays at 1.00. This is still **fake-quant in float**. There are no int8 kernels, no activation quantization, and it is not TensorRT, torchao, or ONNX Runtime.
 
 ## Design notes
 

@@ -22,6 +22,15 @@ quantize:
   # Leave matching weight tensors in float (substring match on names: stem_w, dw_w, pw_w, fc_w).
   # Example: [fc] keeps the classifier head float (selective / skip-sensitive-layers pattern).
   skip: []
+  # Round 4: per_tensor (one scale/zp per weight tensor) | per_channel (one per
+  # output channel, axis 0). Applies to the configured PTQ row, compose and QAT.
+  granularity: per_tensor
+  # Report extras: int4 rows (makes the granularity gap visible on a toy),
+  # per-layer weight-quant error table, and a function-preserving depthwise
+  # outlier stress test (channel 0 ×factor, pointwise input ÷factor; 0 = off).
+  int4_rows: true
+  error_table: true
+  dw_outlier_factor: 64
 prune:
   sparsity: 0.5
 # Ordered compression pipeline for the compose eval row (prune → int8 fake-quant).

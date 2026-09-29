@@ -11,7 +11,13 @@ from efficient_cnn.data import train_test_split
 from efficient_cnn.metrics import estimate_flops, param_count
 from efficient_cnn.model import TinyEfficientCNN
 from efficient_cnn.prune import prune_model
-from efficient_cnn.quantize import quantize_model
+from efficient_cnn.quantize import (
+    VALID_GRANULARITIES,
+    format_layer_error_table,
+    layer_error_table,
+    quantize_model,
+    rescale_depthwise_channel,
+)
 from efficient_cnn.train import train
 from efficient_cnn.distill import run_kd_demo
 from efficient_cnn.qat import run_qat_demo
@@ -40,6 +46,7 @@ def apply_compose(
     *,
     bits: int,
     sparsity: float,
+    granularity: str = "per_tensor",
 ) -> tuple[TinyEfficientCNN, dict[str, Any]]:
     """
     Apply compression steps in order (teaching toy — fake-quant, not real INT8 kernels).
@@ -57,12 +64,13 @@ def apply_compose(
                 "nonzero_after": p_stats.nonzero_after,
             }
         elif step == "quantize":
-            current, q_stats = quantize_model(current, bits=bits)
+            current, q_stats = quantize_model(current, bits=bits, granularity=granularity)
             meta["steps"]["quantize"] = {
                 "bits": q_stats.bits,
                 "nbytes_fp64": q_stats.nbytes_fp64,
                 "nbytes_int8": q_stats.nbytes_int8,
                 "observer": q_stats.observer,
+                "granularity": q_stats.granularity,
                 "skipped": list(q_stats.skipped),
             }
         else:  # pragma: no cover - validated in _compose_order
@@ -117,19 +125,35 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     observer = str(q.get("observer", "minmax"))
     percentile = float(q.get("percentile", 99.0))
     skip = list(q.get("skip") or [])
+    granularity = str(q.get("granularity", "per_tensor")).lower()
+    if granularity not in VALID_GRANULARITIES:
+        raise ValueError(
+            f"quantize.granularity must be one of {VALID_GRANULARITIES}; got {granularity!r}"
+        )
 
-    def _quant_row(obs: str, skip_list: list[str], *, label_bits: bool = True) -> tuple:
+    def _quant_row(
+        obs: str,
+        skip_list: list[str],
+        *,
+        label_bits: bool = True,
+        gran: str = "per_tensor",
+        n_bits: int | None = None,
+        src: TinyEfficientCNN | None = None,
+    ) -> tuple:
+        use_bits = bits if n_bits is None else int(n_bits)
         qm, qs = quantize_model(
-            model,
-            bits=bits,
+            model if src is None else src,
+            bits=use_bits,
             observer=obs,
             percentile=percentile,
             skip=skip_list,
+            granularity=gran,
         )
         loss, acc = qm.loss_acc(test_ds.X, test_ds.y)
         row = {
-            "bits": qs.bits if label_bits else bits,
+            "bits": qs.bits if label_bits else use_bits,
             "observer": qs.observer,
+            "granularity": qs.granularity,
             "percentile": qs.percentile,
             "skip": list(skip_list),
             "skipped": list(qs.skipped),
@@ -137,18 +161,44 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
             "loss": loss,
             "acc": acc,
             "nbytes_int8_pack": qs.nbytes_int8,
+            "nbytes_qparams": qs.nbytes_qparams,
             "size_ratio": qs.nbytes_int8 / max(qs.nbytes_fp64, 1),
             "acc_drop": base_acc - acc,
         }
         return qm, qs, row
 
     # Default quantized row = configured observer + skip (backward-compatible key)
-    _, q_stats, quantized_row = _quant_row(observer, skip)
+    _, q_stats, quantized_row = _quant_row(observer, skip, gran=granularity)
     _, _, int8_minmax_row = _quant_row("minmax", [])
     _, _, int8_percentile_row = _quant_row("percentile", [])
     # Skip-head teaching row: leave classifier (fc*) in float
     skip_head = skip if skip else ["fc"]
     _, _, int8_skip_head_row = _quant_row("minmax", skip_head)
+
+    # Round 4: granularity ablation (minmax, no skip) + optional int4 rows
+    gran_rows: dict[str, dict[str, Any]] = {}
+    bits_list = [8] + ([4] if q.get("int4_rows", True) else [])
+    for nb in bits_list:
+        for g in VALID_GRANULARITIES:
+            _, _, gran_rows[f"int{nb}_{g}"] = _quant_row("minmax", [], gran=g, n_bits=nb)
+    x_probe = test_ds.X[: min(64, len(test_ds))]
+    err_rows = (
+        layer_error_table(model, bits_list, x=x_probe) if q.get("error_table", True) else []
+    )
+    outlier: dict[str, Any] | None = None
+    factor = float(q.get("dw_outlier_factor", 0) or 0)
+    if factor > 0:
+        # Function-preserving: same float logits, one wide depthwise channel.
+        om = rescale_depthwise_channel(model, channel=0, factor=factor)
+        o_loss, o_acc = om.loss_acc(test_ds.X, test_ds.y)
+        outlier = {"factor": factor, "channel": 0, "float_acc": o_acc, "float_loss": o_loss}
+        for nb in bits_list:
+            for g in VALID_GRANULARITIES:
+                _, _, r = _quant_row("minmax", [], gran=g, n_bits=nb, src=om)
+                outlier[f"int{nb}_{g}"] = {"acc": r["acc"], "loss": r["loss"]}
+        outlier["layer_error_table"] = [
+            r for r in layer_error_table(om, bits_list, x=x_probe) if r["is_depthwise"]
+        ]
 
     p_model, p_stats = prune_model(model, sparsity=float(p["sparsity"]))
     p_loss, p_acc = p_model.loss_acc(test_ds.X, test_ds.y)
@@ -159,6 +209,7 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         order,
         bits=bits,
         sparsity=float(p["sparsity"]),
+        granularity=granularity,
     )
     c_loss, c_acc = c_model.loss_acc(test_ds.X, test_ds.y)
     c_nnz = param_count(c_model, nonzero_only=True)
@@ -179,6 +230,8 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         "int8_minmax": int8_minmax_row,
         "int8_percentile": int8_percentile_row,
         "int8_skip_head": int8_skip_head_row,
+        "granularity_ablation": gran_rows,
+        "layer_error_table": err_rows,
         "pruned": {
             "sparsity": p_stats.sparsity,
             "loss": p_loss,
@@ -203,8 +256,11 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
             "observer": observer,
             "percentile": percentile,
             "skip": skip,
+            "granularity": granularity,
         },
     }
+    if outlier is not None:
+        report["dw_outlier"] = outlier
     distill_cfg = cfg.get("distill") or {}
     if distill_cfg.get("enabled", False):
         report["distill"] = run_kd_demo(cfg, train_ds, test_ds)
@@ -246,6 +302,21 @@ def format_report(report: dict[str, Any]) -> str:
         f"nbytes≈{c['nbytes_int8_pack']}  size_ratio={c['size_ratio']:.3f}  "
         f"acc_drop={c['acc_drop']:+.3f}",
     ]
+    for key, r in (report.get("granularity_ablation") or {}).items():
+        lines.append(
+            f"  {key:<16} loss={r['loss']:.4f}  acc={r['acc']:.3f}  "
+            f"qparams={r['nbytes_qparams']}B  acc_drop={r['acc_drop']:+.3f}"
+        )
+    if report.get("layer_error_table"):
+        lines.append(format_layer_error_table(report["layer_error_table"]))
+    if "dw_outlier" in report:
+        o = report["dw_outlier"]
+        accs = "  ".join(
+            f"{k}={v['acc']:.3f}" for k, v in o.items() if k.startswith("int")
+        )
+        lines.append(
+            f"  dw_outlier x{o['factor']:g} (float_acc={o['float_acc']:.3f}, same logits)  {accs}"
+        )
     if "distill" in report:
         d = report["distill"]
         lines.append(
