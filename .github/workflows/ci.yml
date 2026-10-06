@@ -28,3 +28,5 @@ jobs:
         run: python evals/runner.py
       - name: Run module CLI
         run: python -m efficient_cnn
+      - name: Auto mixed precision CLI
+        run: python evals/runner.py --mixed-precision --max-acc-drop 0.0

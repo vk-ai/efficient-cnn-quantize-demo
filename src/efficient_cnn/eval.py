@@ -9,6 +9,11 @@ import numpy as np
 from efficient_cnn.config import load_config
 from efficient_cnn.data import train_test_split
 from efficient_cnn.metrics import estimate_flops, param_count
+from efficient_cnn.mixed_precision import (
+    DEFAULT_LADDER,
+    format_mixed_precision,
+    run_auto_mixed_precision,
+)
 from efficient_cnn.model import TinyEfficientCNN
 from efficient_cnn.prune import prune_model
 from efficient_cnn.quantize import (
@@ -78,17 +83,12 @@ def apply_compose(
     return current, meta
 
 
-def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Train tiny CNN, then compare float / quantized / pruned / prune→int8 on held-out set."""
-    cfg = cfg or load_config()
+def build_trained_model(cfg: dict[str, Any]) -> tuple[Any, Any, TinyEfficientCNN]:
+    """Synthetic train/test split + the trained float toy CNN (shared by every eval)."""
     seed = int(cfg["seed"])
     d = cfg["data"]
     m = cfg["model"]
     t = cfg["train"]
-    q = cfg["quantize"]
-    p = cfg["prune"]
-    order = _compose_order(cfg)
-
     train_ds, test_ds = train_test_split(
         n_train=int(d["n_train"]),
         n_test=int(d["n_test"]),
@@ -99,7 +99,6 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         noise=float(d["noise"]),
         seed=seed,
     )
-
     rng = np.random.default_rng(seed)
     model = TinyEfficientCNN(
         in_channels=int(d["channels"]),
@@ -115,6 +114,51 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         batch_size=int(t["batch_size"]),
         seed=seed,
     )
+    return train_ds, test_ds, model
+
+
+def run_auto_mixed_precision_demo(
+    cfg: dict[str, Any] | None = None,
+    model: TinyEfficientCNN | None = None,
+    train_ds: Any = None,
+    test_ds: Any = None,
+) -> dict[str, Any]:
+    """Round 5: sensitivity-driven per-layer precision on the clean model (+ dw outlier).
+
+    Decisions use the first ``calib_samples`` *training* examples. The test split only
+    scores the result. Returns ``{"clean": report[, "dw_outlier": report]}``.
+    """
+    cfg = cfg or load_config()
+    if model is None:
+        train_ds, test_ds, model = build_trained_model(cfg)
+    q = cfg["quantize"]
+    amp = q.get("auto_mixed_precision") or {}
+    n_calib = int(amp.get("calib_samples", 128))
+    xc, yc = train_ds.X[:n_calib], train_ds.y[:n_calib]
+    kw = dict(
+        max_acc_drop=float(amp.get("max_acc_drop", 0.01)),
+        ladder=list(amp.get("ladder") or DEFAULT_LADDER),
+        granularity=str(amp.get("granularity", q.get("granularity", "per_tensor"))).lower(),
+        observer=str(q.get("observer", "minmax")),
+        percentile=float(q.get("percentile", 99.0)),
+    )
+    out = {"clean": run_auto_mixed_precision(model, xc, yc, test_ds.X, test_ds.y, **kw)}
+    factor = float(q.get("dw_outlier_factor", 0) or 0)
+    if factor > 0 and amp.get("dw_outlier", True):
+        om = rescale_depthwise_channel(model, channel=0, factor=factor)
+        out["dw_outlier"] = run_auto_mixed_precision(om, xc, yc, test_ds.X, test_ds.y, **kw)
+    return out
+
+
+def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Train tiny CNN, then compare float / quantized / pruned / prune→int8 on held-out set."""
+    cfg = cfg or load_config()
+    d = cfg["data"]
+    q = cfg["quantize"]
+    p = cfg["prune"]
+    order = _compose_order(cfg)
+
+    train_ds, test_ds, model = build_trained_model(cfg)
 
     base_loss, base_acc = model.loss_acc(test_ds.X, test_ds.y)
     base_params = param_count(model)
@@ -261,6 +305,10 @@ def run_before_after(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     }
     if outlier is not None:
         report["dw_outlier"] = outlier
+    if (q.get("auto_mixed_precision") or {}).get("enabled", False):
+        report["auto_mixed_precision"] = run_auto_mixed_precision_demo(
+            cfg, model, train_ds, test_ds
+        )
     distill_cfg = cfg.get("distill") or {}
     if distill_cfg.get("enabled", False):
         report["distill"] = run_kd_demo(cfg, train_ds, test_ds)
@@ -317,6 +365,8 @@ def format_report(report: dict[str, Any]) -> str:
         lines.append(
             f"  dw_outlier x{o['factor']:g} (float_acc={o['float_acc']:.3f}, same logits)  {accs}"
         )
+    for key, amp in (report.get("auto_mixed_precision") or {}).items():
+        lines.append(format_mixed_precision(amp, key))
     if "distill" in report:
         d = report["distill"]
         lines.append(
