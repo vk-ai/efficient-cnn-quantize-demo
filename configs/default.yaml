@@ -31,6 +31,17 @@ quantize:
   int4_rows: true
   error_table: true
   dw_outlier_factor: 64
+  # Round 5: pick float/int8/int4/int2 per layer from measured sensitivity
+  # (greedy, smallest logit-MSE per byte saved first) under an accuracy budget.
+  # Decisions use the first calib_samples *training* examples; the test split
+  # only scores the result. Also re-run on the dw_outlier model when enabled.
+  auto_mixed_precision:
+    enabled: true
+    max_acc_drop: 0.01
+    ladder: [float, 8, 4, 2]
+    granularity: per_tensor
+    calib_samples: 128
+    dw_outlier: true
 prune:
   sparsity: 0.5
 # Ordered compression pipeline for the compose eval row (prune → int8 fake-quant).
